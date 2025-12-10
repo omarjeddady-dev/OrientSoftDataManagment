@@ -17,30 +17,24 @@ WEBSITE_URL = "https://www.orientscale.ma"
 PHONE_NUMBER = "0661572700"
 LOGO_PATH = "logo.png"
 
-# --- 🛠️ JSON KEY MAPPING (BASED ON YOUR SCREENSHOT) 🛠️ ---
-# These are the EXACT keys seen in your JSON file. Do not change these unless the JSON changes.
+# --- 🛠️ JSON KEY MAPPING 🛠️ ---
 JSON_KEY_PLATE = "plate"
 JSON_KEY_PRODUCT = "product"
 JSON_KEY_CLIENT = "client"
 JSON_KEY_DRIVER = "driver"
-JSON_KEY_WEIGHT = "net"      # Using 'net' weight as standard
+JSON_KEY_WEIGHT = "net"
 JSON_KEY_PRICE = "price"
-JSON_KEY_DATE = "date_out"   # Using date_out as the transaction time
+JSON_KEY_DATE = "date_out"
 
 # --- 🛠️ CUSTOM FIELDS CONFIGURATION 🛠️ ---
-# Map the JSON keys (ex1, ex2, ex3) to Human Readable Names (Destination, Source, etc.)
+UI_NAME_1 = "Destination"
+JSON_KEY_1 = "ex1"
 
-# Field 1
-UI_NAME_1 = "Destination"    # What the user sees in the Dashboard
-JSON_KEY_1 = "ex1"           # The key in the JSON file
+UI_NAME_2 = "Source"
+JSON_KEY_2 = "ex2"
 
-# Field 2
-UI_NAME_2 = "Source"         # What the user sees
-JSON_KEY_2 = "ex2"           # The key in the JSON file
-
-# Field 3
-UI_NAME_3 = "Remorque"       # What the user sees
-JSON_KEY_3 = "ex3"           # The key in the JSON file
+UI_NAME_3 = "Remorque"
+JSON_KEY_3 = "ex3"
 
 # Drive Config
 FOLDER_ID = "115OinwLcQMYZ2l50qMEACnCt-9pXiy1o"
@@ -131,18 +125,31 @@ TRANSLATIONS = {
     }
 }
 
-# --- 3. AUTHENTICATION ---
+# --- 3. AUTHENTICATION (FIXED FOR SECRETS) ---
 @st.cache_resource
 def get_drive_service():
+    """
+    Connect to Google Drive using either a local 'credentials.json' file
+    OR Streamlit Secrets (for Cloud).
+    """
     creds = None
+    
+    # 1. Try Local File (Dev mode)
     if os.path.exists('credentials.json'):
         creds = service_account.Credentials.from_service_account_file('credentials.json', scopes=SCOPES)
+        
+    # 2. Try Streamlit Secrets (Cloud mode)
     elif 'gcp_service_account' in st.secrets:
+        # Load the dictionary from secrets.toml
         creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)   
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        
+    # 3. If neither works, stop app
     if not creds:
-        st.error("❌ Credentials not found.")
+        st.error("❌ Critical Error: No Google Credentials found.")
+        st.info("If you are running online, please ensure you pasted the keys into Streamlit Secrets.")
         st.stop()
+        
     return build('drive', 'v3', credentials=creds)
 
 # --- 4. DATA LOADER ---
@@ -152,9 +159,13 @@ def normalize_filename(name):
 
 @st.cache_data(ttl=600) 
 def load_data_and_map_files(_service, folder_id):
-    query = f"'{folder_id}' in parents and trashed=false"
-    results = _service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get('files', [])
+    try:
+        query = f"'{folder_id}' in parents and trashed=false"
+        results = _service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get('files', [])
+    except Exception as e:
+        st.error(f"Error connecting to Google Drive: {e}")
+        return pd.DataFrame()
     
     json_files = [f for f in files if 'json' in f['name'].lower()]
     pdf_map = {normalize_filename(f['name']): f['id'] for f in files if 'pdf' in f['name'].lower()}
@@ -182,8 +193,7 @@ def load_data_and_map_files(_service, folder_id):
                 norm_name = normalize_filename(file['name'])
                 item['_pdf_file_id'] = pdf_map.get(norm_name)
                 
-                # --- FILL MISSING KEYS TO PREVENT ERRORS ---
-                # This ensures even if a JSON is old, it has the keys we expect
+                # Fill missing keys
                 keys_to_check = [
                     JSON_KEY_PLATE, JSON_KEY_PRODUCT, JSON_KEY_CLIENT, 
                     JSON_KEY_DRIVER, JSON_KEY_WEIGHT, JSON_KEY_PRICE, 
@@ -200,28 +210,27 @@ def load_data_and_map_files(_service, folder_id):
     df = pd.DataFrame(all_records)
     
     if not df.empty:
-        # 1. Clean Date (Using the key from your screenshot)
+        # Clean Date
         df['clean_date'] = pd.to_datetime(df[JSON_KEY_DATE], errors='coerce')
-        # If date_out is empty, try date_in, else now
         if 'date_in' in df.columns:
             df['clean_date'] = df['clean_date'].fillna(pd.to_datetime(df['date_in'], errors='coerce'))
         df['clean_date'] = df['clean_date'].fillna(pd.to_datetime(datetime.datetime.now()))
         
         df['Hour'] = df['clean_date'].dt.hour
         
-        # 2. Clean Price
+        # Clean Price
         df['clean_price'] = pd.to_numeric(
             df[JSON_KEY_PRICE].astype(str).str.replace(r'[^\d.]', '', regex=True), 
             errors='coerce'
         ).fillna(0)
 
-        # 3. Clean Weight
+        # Clean Weight
         df['clean_weight'] = pd.to_numeric(
             df[JSON_KEY_WEIGHT].astype(str).str.replace(r'[^\d.]', '', regex=True), 
             errors='coerce'
         ).fillna(0)
 
-        # 4. Standardize Strings for Filters
+        # Standardize Strings
         df['Main_Product'] = df[JSON_KEY_PRODUCT].astype(str)
         df['Vehicle_Ref'] = df[JSON_KEY_PLATE].astype(str)
         df['Client_Ref'] = df[JSON_KEY_CLIENT].astype(str)
@@ -289,27 +298,23 @@ def main():
     # --- 🔍 FILTERS ---
     with st.expander(L["filter_title"], expanded=True):
         c1, c2 = st.columns([1, 2])
-        min_d, max_d = raw_df['clean_date'].min().date(), raw_df['clean_date'].max().date()
+        min_d = raw_df['clean_date'].min().date() if not raw_df.empty else datetime.date.today()
+        max_d = raw_df['clean_date'].max().date() if not raw_df.empty else datetime.date.today()
+        
         date_range = c1.date_input(L["date_range"], value=(min_d, max_d))
         search_term = c2.text_input(L["global_search"], placeholder="...")
 
         c3, c4, c5, c6 = st.columns(4)
-        # 1. Clients
         sel_clients = c3.multiselect(L["clients"], raw_df['Client_Ref'].unique())
-        # 2. Vehicles (Mapped correctly to 'plate')
         sel_vehs = c4.multiselect(L["vehicles"], raw_df['Vehicle_Ref'].unique())
-        # 3. Products
         sel_prods = c5.multiselect(L["products"], raw_df['Main_Product'].unique())
-        # 4. Drivers
         sel_drivers = c6.multiselect(L["drivers"], raw_df['Driver_Ref'].unique())
 
-        # Custom Fields (Mapped to ex1, ex2, ex3)
         custom_filters = {}
         if UI_NAME_1 or UI_NAME_2 or UI_NAME_3:
             st.markdown("---") 
             cc1, cc2, cc3 = st.columns(3)
             if UI_NAME_1 and JSON_KEY_1 in raw_df.columns:
-                # Get unique values that are not empty
                 vals = [x for x in raw_df[JSON_KEY_1].astype(str).unique() if x and x != "nan"]
                 custom_filters[JSON_KEY_1] = cc1.multiselect(f"{UI_NAME_1}", vals)
             
@@ -324,21 +329,17 @@ def main():
     # --- APPLY FILTERS ---
     filtered_df = raw_df.copy()
     
-    # Date
-    if len(date_range) == 2:
+    if isinstance(date_range, tuple) and len(date_range) == 2:
         filtered_df = filtered_df[(filtered_df['clean_date'].dt.date >= date_range[0]) & (filtered_df['clean_date'].dt.date <= date_range[1])]
     
-    # Main Dropdowns
     if sel_clients: filtered_df = filtered_df[filtered_df['Client_Ref'].isin(sel_clients)]
     if sel_vehs: filtered_df = filtered_df[filtered_df['Vehicle_Ref'].isin(sel_vehs)]
     if sel_prods: filtered_df = filtered_df[filtered_df['Main_Product'].isin(sel_prods)]
     if sel_drivers: filtered_df = filtered_df[filtered_df['Driver_Ref'].isin(sel_drivers)]
     
-    # Custom Dropdowns
     for key, val in custom_filters.items():
         if val: filtered_df = filtered_df[filtered_df[key].astype(str).isin(val)]
 
-    # Search
     if search_term:
         mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_term, case=False)).any(axis=1)
         filtered_df = filtered_df[mask]
@@ -352,9 +353,6 @@ def main():
         with col_list:
             st.markdown(f"### {L['tickets_found']}: {len(filtered_df)}")
             
-            # Prepare clean display columns
-            # We want to show the raw columns from JSON + the Custom names
-            # Hide internal calculations
             cols_to_hide = ['clean_date', 'clean_price', 'clean_weight', 'Hour', 'Main_Product', 'Driver_Ref', 'Client_Ref', 'Vehicle_Ref', '_json_filename', '_pdf_file_id']
             display_cols = [c for c in filtered_df.columns if not c.startswith('_') and c not in cols_to_hide]
             
@@ -366,7 +364,6 @@ def main():
                 sel_row = filtered_df.iloc[event.selection.rows[0]]
                 pdf_id = sel_row.get('_pdf_file_id')
                 
-                # Show Ticket Details above PDF
                 st.info(f"Ticket: {sel_row.get('ticket_no', 'N/A')} | {sel_row.get('plate', 'N/A')}")
                 
                 if pdf_id:
@@ -374,7 +371,7 @@ def main():
                         pdf_fh = fetch_pdf_bytes(service, pdf_id)
                     if pdf_fh:
                         b64_pdf = base64.b64encode(pdf_fh.read()).decode('utf-8')
-                        st.download_button(L["download_pdf"], data=base64.b64decode(b64_pdf), file_name=f"Ticket_{sel_row.get('ticket_no')}.pdf", mime="application/pdf", use_container_width=True)
+                        st.download_button(L["download_pdf"], data=base64.b64decode(b64_pdf), file_name=f"Ticket_{sel_row.get('ticket_no', 'doc')}.pdf", mime="application/pdf", use_container_width=True)
                         st.markdown(f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="650px" style="border:none;"></iframe>', unsafe_allow_html=True)
                 else:
                     st.warning(L["pdf_missing"])
@@ -413,7 +410,6 @@ def main():
             output = io.BytesIO()
             try:
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    # Export raw visible columns
                     filtered_df.drop(columns=[c for c in filtered_df.columns if c.startswith('_')]).to_excel(writer, index=False)
             except:
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
